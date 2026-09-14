@@ -21,6 +21,7 @@ df = filter(df) do row
     row.underlying_symbol == "SPY" &&  # filter for near the money options so vega isn't close to 0
     abs(row.strike / spot - 1) < 0.02 &&
     days >= 30 && 
+    row.option_type == "C" &&
     row.bid_1545 > 0 && 
     row.ask_1545 > row.bid_1545
 end
@@ -61,7 +62,7 @@ end
 
 function vega(S_t, t, T, K, sigma, r)
     d_plus = 1 / (sigma * sqrt(T - t)) * (log(S_t / K) + (r + sigma^2 / 2) * (T - t))
-    return S * pdf(norm, d_plus) * sqrt(T - t)
+    return S_t * pdf(norm, d_plus) * sqrt(T - t)
 end
 
 # set up optimization function
@@ -114,40 +115,47 @@ for i = 1:rows
 end
 print("\nSkipped $n_invalid invalid results")
 
-valid = [(T, K, vol) for ((T, K), vol) in points] 
-# if !isnothing(vol) && isfinite(vol) && vol > 0]
-
-Ts = [p[1] for p in valid]
-Ks = [p[2] for p in valid]
-vols = [100 * p[3] for p in valid]
-
-figure = scatter(
-    Ks, Ts, vols;
-    marker_z=vols,
-    xlabel="Strike",
-    ylabel="Time to expiry (years)",
-    zlabel="Implied volatility (%)",
-    label="",
-    title="Implied volatility surface",
-    color=:viridis,
-    markersize=3,
-)
-
-savefig(figure, "volatility_scatter.png")
-
 Ks = sort(unique([K for ((T, K), vol) in points]))
 Ts = sort(unique([T for ((T, K), vol) in points]))
 
 # Rows correspond to expirations; columns correspond to strikes.
 # Z = [100 * points[(T, K)] for T in Ts, K in Ks]
-Z = [100 * get(points, (T, K), NaN) for T in Ts, K in Ks]
+# Z = [100 * get(points, (T, K), NaN) for T in Ts, K in Ks]
+Z = fill(NaN, length(Ts), length(Ks))
 
+for (i, expiry) in enumerate(Ts)
+    observed = sort([(K, vol) for ((T,K), vol) in points if T == expiry], by = first)
+    strikes = first.(observed)
+    sigmas = last.(observed)
+
+    for (j, K) in enumerate(Ks)
+        idx = searchsortedfirst(strikes, K)
+
+        # if there is a value
+        if idx <= length(strikes) && strikes[idx] == K && !isnan(sigmas[idx])
+            Z[i,j] = 100 * sigmas[idx]
+        # if interp needed
+        elseif 1 < idx <= length(strikes)
+            left, right = idx - 1, idx
+            weight = (K - strikes[left]) / (strikes[right] - strikes[left])
+            sigma = (1 - weight) * sigmas[left] + weight * sigmas[right]
+            Z[i, j] = 100 * sigma 
+        end
+
+    end
+end
+    
+
+
+zmin =  minimum(Z) * 0.5
+zmax =  maximum(Z) * 2
 figure = surface(
     Ks, Ts, Z;
     xlabel="Strike",
     ylabel="Time to expiry (years)",
     zlabel="Implied volatility (%)",
     color=:viridis,
+    zlims=(zmin,zmax),
     label="",
 )
 
