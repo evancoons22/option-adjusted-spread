@@ -9,7 +9,7 @@ norm = Normal()
 # p_density = pdf(d,0.0)
 #
 
-df = CSV.read("./data/UnderlyingOptionsEODCalcs_2023-08-25_cgi_or_historical.csv", DataFrame, limit=10000)
+df = CSV.read("./data/UnderlyingOptionsEODCalcs_2023-08-25_cgi_or_historical.csv", DataFrame)
 # df = filter(row -> row.underlying_symbol == "SPY", df)
 # df = first(df, 1)
 # print(describe(df))
@@ -124,7 +124,8 @@ Ts = sort(unique([T for ((T, K), vol) in points]))
 Z = fill(NaN, length(Ts), length(Ks))
 
 for (i, expiry) in enumerate(Ts)
-    observed = sort([(K, vol) for ((T,K), vol) in points if T == expiry], by = first)
+    # observed = sort([(K, vol) for ((T,K), vol) in points if T == expiry], by = first)
+    observed = sort([ (K, vol) for ((T, K), vol) in points if T == expiry && !isnothing(vol) && isfinite(vol) && vol > 0 ]; by=first)
     strikes = first.(observed)
     sigmas = last.(observed)
 
@@ -147,8 +148,13 @@ end
     
 
 
-zmin =  minimum(Z) * 0.5
-zmax =  maximum(Z) * 2
+# Z = filter(isfinite, Z)
+valid_z = filter(isfinite, vec(Z))
+isempty(valid_z) && error("No finite volatility values in Z.")
+
+zmin =  minimum(valid_z) * 0.8
+zmax =  maximum(valid_z) * 1.2 
+print("\nzmin $zmin zmax $zmax")
 figure = surface(
     Ks, Ts, Z;
     xlabel="Strike",
