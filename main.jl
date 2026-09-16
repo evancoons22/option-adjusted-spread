@@ -15,17 +15,6 @@ df = CSV.read("./data/UnderlyingOptionsEODCalcs_2023-08-25_cgi_or_historical.csv
 # print(describe(df))
 # print(df)
 
-df = filter(df) do row
-    days = Dates.value(Date(row.expiration) - Date(row.quote_date))
-    spot = (row.underlying_bid_1545 + row.underlying_ask_1545) / 2
-    row.underlying_symbol == "SPY" &&  # filter for near the money options so vega isn't close to 0
-    abs(row.strike / spot - 1) < 0.02 &&
-    days >= 30 && 
-    row.option_type == "C" &&
-    row.bid_1545 > 0 && 
-    row.ask_1545 > row.bid_1545
-end
-# df = first(df, 1)
 
 function Newton(f, df, x_0, tolerance, iters)
     x = x_0
@@ -54,97 +43,101 @@ function Newton(f, df, x_0, tolerance, iters)
     error("did not converge within $iters iterations.")
 end
 
+# function defining the call option value using black-scholes
 function C(S_t, t, T, K, sigma, r)
     d_plus = 1 / (sigma * sqrt(T - t)) * (log(S_t / K) + (r + sigma^2 / 2) * (T - t))
     d_minus = d_plus - sigma * sqrt(T - t)
     return cdf(norm, d_plus) * S_t - cdf(norm, d_minus) * K * exp((-1) * r * (T - t))
 end
 
+# first derivative of volatility dC/d\sigma (usually dV\d\sigma)
 function vega(S_t, t, T, K, sigma, r)
     d_plus = 1 / (sigma * sqrt(T - t)) * (log(S_t / K) + (r + sigma^2 / 2) * (T - t))
     return S_t * pdf(norm, d_plus) * sqrt(T - t)
 end
 
-# set up optimization function
-# S = (df[1, "underlying_bid_1545"] + df[1, "underlying_ask_1545"]) / 2
-# t = 0
-# T = Dates.value( Date(df[1, "expiration"]) - Date(df[1, "quote_date"])) / 365
-# K = df[1, "strike"] 
-# r = RFR
-# print("S: ", S, "\nt: ", t, "\nT: ", T, "\nK: ", K, "\nr: ", r, "\n")
-# call_price = (df[1, "bid_1545"] + df[1, "ask_1545"]) / 2
-# C_test = sigma -> C(S, t, T, K, sigma, r) - call_price
-# 
-# # set up df
-# vega_test = sigma -> vega(S, t, T, K, sigma, r)
-# 
-# # newton method
-# impl_vol = Newton(C_test, vega_test, 0.3, 0.005, 100)
-# print(impl_vol)
+function calculate_volatility_surface(df)
+    points = Dict()
+    S = (df[1, "underlying_bid_1545"] + df[1, "underlying_ask_1545"]) / 2
+    t = 0
+    r = RFR
+    rows = nrow(df)
+    n_invalid = 0
+    print("\nCalculating volatility surface for strike price $S")
+        for i = 1:rows
+            T = Dates.value( Date(df[i, "expiration"]) - Date(df[i, "quote_date"])) / 365
+            K = df[i, "strike"] 
+            call_price = (df[i, "bid_1545"] + df[i, "ask_1545"]) / 2
+            C_test = sigma -> C(S, t, T, K, sigma, r) - call_price
+            vega_test = sigma -> vega(S, t, T, K, sigma, r)
 
-# Iterate through 
+            try
+                impl_vol = Newton(C_test, vega_test, 0.3, 0.005, 100)
+                points[(T, K)] = impl_vol
+            catch err
+                global n_invalid += 1
+                @warn "Newton failed; skipping row" i T K reason=sprint(showerror, err)
+                continue
+            end
 
-points = Dict()
-S = (df[1, "underlying_bid_1545"] + df[1, "underlying_ask_1545"]) / 2
-t = 0
-r = RFR
-rows = nrow(df)
-n_invalid = 0
-print("\nCalculating volatility surface for strike price $S")
-for i = 1:rows
-    T = Dates.value( Date(df[i, "expiration"]) - Date(df[i, "quote_date"])) / 365
-    K = df[i, "strike"] 
-    call_price = (df[i, "bid_1545"] + df[i, "ask_1545"]) / 2
-    C_test = sigma -> C(S, t, T, K, sigma, r) - call_price
-    vega_test = sigma -> vega(S, t, T, K, sigma, r)
-
-    try
-        impl_vol = Newton(C_test, vega_test, 0.3, 0.005, 100)
-        points[(T, K)] = impl_vol
-    catch err
-        # Preserve Ctrl+C so you can still stop the program.
-        # err isa InterruptException && rethrow()
-        global n_invalid += 1
-        # @warn "Newton failed; skipping row" i T K reason=sprint(showerror, err)
-        continue
-    end
-
-    if i % 20 == 0
-        print("\niter $i / $rows")
-    end
-end
-print("\nSkipped $n_invalid invalid results")
-
-Ks = sort(unique([K for ((T, K), vol) in points]))
-Ts = sort(unique([T for ((T, K), vol) in points]))
-
-# Rows correspond to expirations; columns correspond to strikes.
-# Z = [100 * points[(T, K)] for T in Ts, K in Ks]
-# Z = [100 * get(points, (T, K), NaN) for T in Ts, K in Ks]
-Z = fill(NaN, length(Ts), length(Ks))
-
-for (i, expiry) in enumerate(Ts)
-    # observed = sort([(K, vol) for ((T,K), vol) in points if T == expiry], by = first)
-    observed = sort([ (K, vol) for ((T, K), vol) in points if T == expiry && !isnothing(vol) && isfinite(vol) && vol > 0 ]; by=first)
-    strikes = first.(observed)
-    sigmas = last.(observed)
-
-    for (j, K) in enumerate(Ks)
-        idx = searchsortedfirst(strikes, K)
-
-        # if there is a value
-        if idx <= length(strikes) && strikes[idx] == K && !isnan(sigmas[idx])
-            Z[i,j] = 100 * sigmas[idx]
-        # if interp needed
-        elseif 1 < idx <= length(strikes)
-            left, right = idx - 1, idx
-            weight = (K - strikes[left]) / (strikes[right] - strikes[left])
-            sigma = (1 - weight) * sigmas[left] + weight * sigmas[right]
-            Z[i, j] = 100 * sigma 
         end
-
-    end
+        print("\n\tSkipped $n_invalid invalid results")
+        return points
 end
+
+function interpolate_grid(points)
+    # assumes points is a map (T, K) -> vol
+    Ks = sort(unique([K for ((T, K), vol) in points]))
+    Ts = sort(unique([T for ((T, K), vol) in points]))
+
+    # Rows correspond to expirations; columns correspond to strikes.
+    # Z = [100 * points[(T, K)] for T in Ts, K in Ks]
+    # Z = [100 * get(points, (T, K), NaN) for T in Ts, K in Ks]
+    Z = fill(NaN, length(Ts), length(Ks))
+
+    for (i, expiry) in enumerate(Ts)
+        # observed = sort([(K, vol) for ((T,K), vol) in points if T == expiry], by = first)
+        observed = sort([ (K, vol) for ((T, K), vol) in points if T == expiry && !isnothing(vol) && isfinite(vol) && vol > 0 ]; by=first)
+        strikes = first.(observed)
+        sigmas = last.(observed)
+
+        for (j, K) in enumerate(Ks)
+            idx = searchsortedfirst(strikes, K)
+
+            # if there is a value
+            if idx <= length(strikes) && strikes[idx] == K && !isnan(sigmas[idx])
+                Z[i,j] = 100 * sigmas[idx]
+            # if interp needed
+            elseif 1 < idx <= length(strikes)
+                left, right = idx - 1, idx
+                weight = (K - strikes[left]) / (strikes[right] - strikes[left])
+                sigma = (1 - weight) * sigmas[left] + weight * sigmas[right]
+                Z[i, j] = 100 * sigma 
+            end
+
+        end
+    end
+    return (Ks, Ts, Z)
+end
+
+
+# load data
+df = filter(df) do row
+    days = Dates.value(Date(row.expiration) - Date(row.quote_date))
+    spot = (row.underlying_bid_1545 + row.underlying_ask_1545) / 2
+    row.underlying_symbol == "SPY" &&  # filter for near the money options so vega isn't close to 0
+    abs(row.strike / spot - 1) < 0.02 &&
+    days >= 30 && 
+    row.option_type == "C" &&
+    row.bid_1545 > 0 && 
+    row.ask_1545 > row.bid_1545
+end
+# df = first(df, 1)
+
+
+points = calculate_volatility_surface(df)
+Ks, Ts, Z = interpolate_grid(points)
+
     
 
 
@@ -154,7 +147,6 @@ isempty(valid_z) && error("No finite volatility values in Z.")
 
 zmin =  minimum(valid_z) * 0.8
 zmax =  maximum(valid_z) * 1.2 
-print("\nzmin $zmin zmax $zmax")
 figure = surface(
     Ks, Ts, Z;
     xlabel="Strike",
@@ -165,7 +157,8 @@ figure = surface(
     label="",
 )
 
-savefig(figure, "volatility_surface.png")
+savefig(figure, "output/volatility_surface.png")
+print("\nSaved figure to output/volatility_surface.png")
 
 
 # optimization
